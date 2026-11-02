@@ -19,6 +19,7 @@
 #include "openvino/runtime/remote_context.hpp"
 #include "openvino/runtime/remote_tensor.hpp"
 #include "continuous_batching/cache/i_cache_manager.hpp"
+#include "continuous_batching/cache/host_prefix_store.hpp"
 
 namespace ov::genai {
 
@@ -292,6 +293,32 @@ public:
                 }
             }
         }
+    }
+
+    void export_block(size_t block_index, std::vector<ov::Tensor>& out) override {
+        out.clear();
+        std::vector<ov::Tensor> copied;
+        for (const auto& group : m_groups) {
+            for (size_t layer_idx : group.sorted_indices) {
+                const auto& info = group.layers.at(layer_idx);
+                if (!cache_block_can_spill(info.tensor)) {
+                    return;
+                }
+                copied.push_back(copy_cache_block_to_host(info.tensor, block_index));
+            }
+        }
+        out = std::move(copied);
+    }
+
+    void import_block(size_t block_index, const std::vector<ov::Tensor>& tensors) override {
+        size_t tensor_idx = 0;
+        for (auto& group : m_groups) {
+            for (size_t layer_idx : group.sorted_indices) {
+                OPENVINO_ASSERT(tensor_idx < tensors.size(), "Host linear-attention block is missing a state tensor");
+                copy_host_block_to_cache(tensors[tensor_idx++], group.layers.at(layer_idx).tensor, block_index);
+            }
+        }
+        OPENVINO_ASSERT(tensor_idx == tensors.size(), "Host linear-attention block has unexpected state tensors");
     }
 
     void clear() override {

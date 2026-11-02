@@ -8,6 +8,7 @@
 
 #include "openvino/runtime/tensor.hpp"
 #include "continuous_batching/cache/i_cache_manager.hpp"
+#include "continuous_batching/cache/host_prefix_store.hpp"
 #include "utils.hpp"
 namespace ov::genai {
 
@@ -331,6 +332,29 @@ public:
                     }
                 }
             }
+        }
+    }
+
+    void export_block(size_t block_index, std::vector<ov::Tensor>& out) override {
+        out.clear();
+        std::vector<ov::Tensor> copied;
+        copied.reserve(m_num_layers * 2);
+        for (size_t layer = 0; layer < m_num_layers; ++layer) {
+            if (!cache_block_can_spill(m_key_cache[layer]) || !cache_block_can_spill(m_value_cache[layer])) {
+                return;
+            }
+            copied.push_back(copy_cache_block_to_host(m_key_cache[layer], block_index));
+            copied.push_back(copy_cache_block_to_host(m_value_cache[layer], block_index));
+        }
+        out = std::move(copied);
+    }
+
+    void import_block(size_t block_index, const std::vector<ov::Tensor>& tensors) override {
+        OPENVINO_ASSERT(tensors.size() == m_num_layers * 2, "Host KV block does not match this cache");
+        size_t tensor_idx = 0;
+        for (size_t layer = 0; layer < m_num_layers; ++layer) {
+            copy_host_block_to_cache(tensors[tensor_idx++], m_key_cache[layer], block_index);
+            copy_host_block_to_cache(tensors[tensor_idx++], m_value_cache[layer], block_index);
         }
     }
 

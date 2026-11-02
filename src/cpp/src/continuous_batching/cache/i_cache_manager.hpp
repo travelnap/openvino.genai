@@ -8,6 +8,9 @@
 #include <map>
 #include <set>
 #include <string>
+#include <vector>
+
+#include "openvino/runtime/tensor.hpp"
 
 namespace ov::genai {
 
@@ -64,6 +67,21 @@ public:
 
     /// @return Number of blocks currently allocated in physical storage.
     virtual size_t get_num_allocated_blocks() const = 0;
+
+    /**
+     * @brief Copy one physical block into host tensors, in a stable per-cache order.
+     * The default implementation cannot spill, so the host store skips that block.
+     */
+    virtual void export_block(size_t block_index, std::vector<ov::Tensor>& out) {
+        (void)block_index;
+        out.clear();
+    }
+
+    /// @brief Copy host tensors previously produced by export_block back into one physical block.
+    virtual void import_block(size_t block_index, const std::vector<ov::Tensor>& tensors) {
+        (void)block_index;
+        (void)tensors;
+    }
 };
 
 }  // namespace ov::genai

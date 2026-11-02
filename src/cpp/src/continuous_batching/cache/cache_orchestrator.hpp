@@ -22,6 +22,7 @@
 #include "continuous_batching/cache/block_manager.hpp"
 #include "continuous_batching/cache/kv_cache_manager.hpp"
 #include "continuous_batching/cache/linear_attention_cache_manager.hpp"
+#include "continuous_batching/cache/host_prefix_store.hpp"
 #include "logger.hpp"
 
 namespace ov::genai {
@@ -226,6 +227,32 @@ public:
         OPENVINO_ASSERT(num_layers > 0, "Cache type must register at least one block-table layer");
         OPENVINO_ASSERT(per_layer_control || num_layers == 1,
             "Cache types without per-layer block-table control must register exactly one shared block-table layer");
+        if (m_host_budget == nullptr) {
+            m_host_budget = std::make_shared<HostPrefixBudget>();
+            m_host_budget->limit = host_prefix_budget_bytes();
+            if (m_host_budget->limit > 0) {
+                std::fprintf(stderr, "[host-prefix] DRAM prefix store cap %zu bytes\n", m_host_budget->limit);
+                std::fflush(stderr);
+            }
+        }
+        if (m_host_budget->limit > 0) {
+            BlockManager* manager = block_mgr.get();
+            auto store = std::make_shared<HostPrefixStore>(cache_mgr.get(), m_host_budget, [manager](uint64_t hash) {
+                manager->forget_host_hash_unlocked(hash);
+            });
+            m_host_stores.push_back(store);
+            HostSpillHooks hooks;
+            hooks.save = [store](uint64_t hash, int block_index) {
+                store->save(hash, block_index);
+            };
+            hooks.contains = [store](uint64_t hash) {
+                return store->contains(hash);
+            };
+            hooks.load = [store](uint64_t hash, int block_index) {
+                store->load(hash, block_index);
+            };
+            block_mgr->set_host_spill(std::move(hooks));
+        }
         m_cache_managers[type] = std::move(cache_mgr);
         m_block_managers[type] = std::move(block_mgr);
         if (type == CacheType::KV_CACHE) {
@@ -1174,6 +1201,8 @@ private:
 
     std::map<CacheType, std::unique_ptr<ICacheManager>> m_cache_managers;
     std::map<CacheType, std::unique_ptr<BlockManager>> m_block_managers;
+    std::shared_ptr<HostPrefixBudget> m_host_budget;
+    std::vector<std::shared_ptr<HostPrefixStore>> m_host_stores;
     bool m_use_per_layer_kv_block_indices = false;
     std::map<CacheType, std::set<size_t>> m_pending_zero_blocks;
 

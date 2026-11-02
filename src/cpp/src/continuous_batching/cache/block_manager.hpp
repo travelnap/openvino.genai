@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <functional>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -221,6 +222,14 @@ class OverwritableBlocksHashStore {
 
 class CacheStateDumper;
 
+// Copies a prefix block to host memory before its device slot is overwritten, and copies it back
+// when a later prompt needs that hash. Empty hooks leave prefix caching unchanged.
+struct HostSpillHooks {
+    std::function<void(uint64_t hash, int block_index)> save;
+    std::function<bool(uint64_t hash)> contains;
+    std::function<void(uint64_t hash, int block_index)> load;
+};
+
 /**
  * @brief Maintains a layered pool of cache block descriptors, freeing or allocating them as requested.
  */
@@ -234,6 +243,21 @@ class BlockAllocator {
     size_t m_num_layers;
     bool m_enable_prefix_caching;
     ov::genai::OverwritableBlocksHashStore m_overwriteable_blocks;
+    HostSpillHooks m_host_spill;
+
+    void spill_published(const BlocksPerLayer& blocks) {
+        if (!m_host_spill.save || blocks.empty() || !blocks.front()->has_published_hash()) {
+            return;
+        }
+        const int index = blocks.front()->get_index();
+        for (size_t layer = 1; layer < blocks.size(); ++layer) {
+            if (blocks[layer]->get_index() != index) {
+                return;
+            }
+        }
+        m_host_spill.save(static_cast<uint64_t>(blocks.front()->get_hash()), index);
+    }
+
 public:
     struct UncachedBlockAllocation {
         BlocksPerLayer blocks;
@@ -498,6 +522,7 @@ public:
         for (size_t row = 0; row < num_blocks; ++row) {
             auto& allocation = allocations[row];
             if (row >= fresh_count) {
+                spill_published(allocation.blocks);
                 const auto candidate = candidates[row - fresh_count];
                 if (erase_registration_if_owned(candidate->first, allocation.blocks, cached_blocks)) {
                     erased_hashes.push_back(candidate->first);
@@ -562,6 +587,7 @@ public:
             return result;
         }
         result.blocks = m_overwriteable_blocks.get_lru_block_to_overwrite();
+        spill_published(result.blocks);
         result.evicted_hash = result.blocks.front()->get_hash();
         result.evicted_timestamp = result.blocks.front()->get_timestamp();
         if (erase_registration_if_owned(*result.evicted_hash, result.blocks, cached_blocks)) {
@@ -765,6 +791,7 @@ public:
         if (m_overwriteable_blocks.num_blocks() > 0) {
             // get least recently used block from store and reuse it
             result.blocks = m_overwriteable_blocks.get_lru_block_to_overwrite();
+            spill_published(result.blocks);
             const uint64_t previous_hash = result.blocks[0]->get_hash();
             if (erase_registration_if_owned(previous_hash, result.blocks, cached_blocks)) {
                 result.erased_hash = previous_hash;
@@ -811,7 +838,41 @@ public:
     }
 
     bool has_cached_block(size_t hash, const std::map<uint64_t, BlocksPerLayer>& cached_blocks) const {
-        return m_overwriteable_blocks.has_block(hash) || cached_blocks.count(hash) > 0;
+        if (m_overwriteable_blocks.has_block(hash) || cached_blocks.count(hash) > 0) {
+            return true;
+        }
+        return m_host_spill.contains && m_host_spill.contains(static_cast<uint64_t>(hash));
+    }
+
+    void set_host_spill(HostSpillHooks hooks) {
+        m_host_spill = std::move(hooks);
+    }
+
+    bool host_contains(uint64_t hash) const {
+        return m_host_spill.contains && m_host_spill.contains(hash);
+    }
+
+    void host_load(uint64_t hash, int block_index) {
+        OPENVINO_ASSERT(m_host_spill.load, "Host prefix restore requested without a spill store");
+        m_host_spill.load(hash, block_index);
+    }
+
+    bool overwriteable_has(uint64_t hash) const {
+        return m_overwriteable_blocks.has_block(hash);
+    }
+
+    BlocksPerLayer detach_overwriteable(uint64_t hash) {
+        auto it = m_overwriteable_blocks.m_blocks.find(hash);
+        if (it == m_overwriteable_blocks.m_blocks.end()) {
+            return {};
+        }
+        BlocksPerLayer blocks = it->second;
+        m_overwriteable_blocks.m_blocks.erase(it);
+        return blocks;
+    }
+
+    void park_overwriteable(const BlocksPerLayer& blocks) {
+        m_overwriteable_blocks.add(blocks);
     }
 
     BlocksPerLayer peek_cached_block(uint64_t hash, const std::map<uint64_t, BlocksPerLayer>& cached_blocks) const {
@@ -991,6 +1052,9 @@ public:
         if (current.block_content_lengths != plan.block_content_lengths ||
             current.cache_token_position != plan.cache_token_position ||
             current.processed_tokens != plan.processed_tokens || current.logical_block_start != plan.logical_block_start) {
+            return std::nullopt;
+        }
+        if (!stage_host_prefix_blocks(sequence, plan)) {
             return std::nullopt;
         }
         PreparedPrefixRestore prepared(*this, std::move(lock));
@@ -1236,6 +1300,18 @@ public:
         OPENVINO_ASSERT(max_total_blocks == 0 || static_cast<size_t>(num_blocks) <= max_total_blocks,
                         "Block pool is constructed with ", num_blocks,
                         " blocks, which already exceeds its own ceiling of ", max_total_blocks, " blocks");
+    }
+
+    void set_host_spill(HostSpillHooks hooks) {
+        m_allocator.set_host_spill(std::move(hooks));
+    }
+
+    // Called while this manager's cache lock is already held, when a host copy is discarded.
+    void forget_host_hash_unlocked(uint64_t hash) {
+        if (m_allocator.overwriteable_has(hash) || m_prefix_hash_to_cached_blocks.count(hash) > 0) {
+            return;
+        }
+        unregister_cached_hash(hash);
     }
 
     ~BlockManager() {
@@ -2701,6 +2777,9 @@ private:
         OPENVINO_ASSERT(sequences.size() == 1);
         const auto sequence = sequences[0];
         const auto seq_id = sequence->get_id();
+        if (!stage_host_prefix_blocks(sequence, plan)) {
+            return false;
+        }
 
         for (size_t content_len : plan.block_content_lengths) {
             if (!m_allocator.has_cached_block(sequence->get_hash(content_len, m_block_size),
@@ -2741,10 +2820,71 @@ private:
         return true;
     }
 
+    bool reserve_prefix_slot(uint64_t hash, size_t& reserved_slots) const {
+        const bool in_overwriteable = m_allocator.overwriteable_has(hash);
+        const bool on_device = in_overwriteable || m_prefix_hash_to_cached_blocks.count(hash) > 0;
+        const size_t next = reserved_slots + ((in_overwriteable || !on_device) ? 1 : 0);
+        if (next > m_allocator.num_free_blocks(0)) {
+            return false;
+        }
+        reserved_slots = next;
+        return true;
+    }
+
+    // Pulls prefix blocks that only exist in host memory back into device slots before the
+    // ordinary restore path peeks them. Device blocks that belong to this plan are held out of
+    // the LRU list so bringing one block back cannot overwrite another block of the same prefix.
+    bool stage_host_prefix_blocks(const Sequence::Ptr& sequence, const PrefixRestorePlan& plan) {
+        std::vector<BlocksPerLayer> detached;
+        detached.reserve(plan.block_content_lengths.size());
+        struct DetachedGuard {
+            BlockAllocator* allocator = nullptr;
+            std::vector<BlocksPerLayer>* rows = nullptr;
+            ~DetachedGuard() {
+                if (allocator == nullptr || rows == nullptr) {
+                    return;
+                }
+                for (auto& row : *rows) {
+                    if (!row.empty()) {
+                        allocator->park_overwriteable(row);
+                    }
+                }
+            }
+        } guard{&m_allocator, &detached};
+        for (size_t content_length : plan.block_content_lengths) {
+            const uint64_t hash = sequence->get_hash(content_length, m_block_size);
+            BlocksPerLayer rows = m_allocator.detach_overwriteable(hash);
+            if (!rows.empty()) {
+                detached.push_back(std::move(rows));
+            }
+        }
+        for (size_t content_length : plan.block_content_lengths) {
+            const uint64_t hash = sequence->get_hash(content_length, m_block_size);
+            const BlocksPerLayer existing = m_allocator.peek_cached_block(hash, m_prefix_hash_to_cached_blocks);
+            if (existing.size() == m_num_layers) {
+                continue;
+            }
+            if (!m_allocator.host_contains(hash) || !m_allocator.can_allocate_blocks(1)) {
+                return false;
+            }
+            BlocksPerLayer blocks = allocate_cached_block(hash, content_length);
+            if (blocks.size() != m_num_layers || !blocks.front()) {
+                return false;
+            }
+            m_allocator.host_load(hash, blocks.front()->get_index());
+            for (auto& block : blocks) {
+                block->release();
+            }
+            m_allocator.park_overwriteable(blocks);
+        }
+        return true;
+    }
+
     PrefixRestorePlan get_full_prefix_restore_plan(const Sequence::Ptr& sequence,
                                                    size_t capped_token_position,
                                                    size_t prompt_len) const {
         PrefixRestorePlan plan;
+        size_t reserved_slots = 0;
         size_t content_len = 0;
         while (content_len < capped_token_position) {
             size_t prev_iteration_content_len = content_len;
@@ -2754,6 +2894,9 @@ private:
             }
             const auto full_block_hash = sequence->get_hash(content_len, m_block_size);
             if (m_allocator.has_cached_block(full_block_hash, m_prefix_hash_to_cached_blocks)) {
+                if (!reserve_prefix_slot(full_block_hash, reserved_slots)) {
+                    break;
+                }
                 plan.block_content_lengths.push_back(content_len);
                 plan.cache_token_position = content_len;
                 plan.processed_tokens = get_processed_tokens_after_restore(content_len, prompt_len);
@@ -2764,7 +2907,8 @@ private:
                     }
                     const size_t partial_content_len = prev_iteration_content_len + i;
                     const auto hash = sequence->get_hash(partial_content_len, m_block_size);
-                    if (m_allocator.has_cached_block(hash, m_prefix_hash_to_cached_blocks)) {
+                    if (m_allocator.has_cached_block(hash, m_prefix_hash_to_cached_blocks) &&
+                        reserve_prefix_slot(hash, reserved_slots)) {
                         plan.block_content_lengths.push_back(partial_content_len);
                         plan.cache_token_position = partial_content_len;
                         plan.processed_tokens = get_processed_tokens_after_restore(partial_content_len, prompt_len);
@@ -2781,6 +2925,7 @@ private:
                                                      size_t capped_token_position,
                                                      size_t prompt_len) const {
         PrefixRestorePlan plan;
+        size_t reserved_slots = 0;
         size_t latest_content_len = 0;
         size_t interval_end = capped_token_position;
         while (interval_end > 0) {
@@ -2791,6 +2936,12 @@ private:
                 }
                 interval_end = get_interval_start(interval_end);
                 continue;
+            }
+            if (!reserve_prefix_slot(sequence->get_hash(content_len, m_block_size), reserved_slots)) {
+                if (plan.empty()) {
+                    return plan;
+                }
+                break;
             }
             if (latest_content_len == 0) {
                 latest_content_len = content_len;
@@ -3031,7 +3182,9 @@ private:
         auto allocations = m_allocator.allocate_temporary_blocks(
             num_blocks, m_prefix_hash_to_cached_blocks, block_indices, erased_hashes);
         for (uint64_t hash : erased_hashes) {
-            unregister_cached_hash(hash);
+            if (!m_allocator.host_contains(hash)) {
+                unregister_cached_hash(hash);
+            }
         }
         return allocations;
     }
@@ -3046,7 +3199,9 @@ private:
                 OPENVINO_ASSERT(content_length_it != m_cached_hash_to_content_length.end(),
                                 "Evicted prefix hash has no registered content length");
                 erased_content_length = content_length_it->second;
-                unregister_cached_hash(*allocation.erased_hash);
+                if (!m_allocator.host_contains(*allocation.erased_hash)) {
+                    unregister_cached_hash(*allocation.erased_hash);
+                }
             } catch (...) {
                 m_allocator.rollback_uncached_block(std::move(allocation),
                                                     m_prefix_hash_to_cached_blocks);
@@ -3191,7 +3346,7 @@ private:
 
     BlocksPerLayer allocate_cached_block(uint64_t hash, size_t content_length) {
         BlockAllocator::CacheBlockAllocationResult allocation_result = m_allocator.allocate_block(hash, m_prefix_hash_to_cached_blocks);
-        if (allocation_result.erased_hash.has_value()) {
+        if (allocation_result.erased_hash.has_value() && !m_allocator.host_contains(*allocation_result.erased_hash)) {
             unregister_cached_hash(*allocation_result.erased_hash);
         }
         register_cached_content_length(hash, content_length);
