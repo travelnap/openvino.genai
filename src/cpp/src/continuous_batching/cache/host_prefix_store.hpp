@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -143,10 +144,17 @@ public:
             return;
         }
         m_cache->import_block(static_cast<size_t>(block_index), it->second.tensors);
-        m_budget->used -= it->second.bytes;
-        m_entries.erase(it);
-        m_order.remove(hash);
         note_once(m_announced_load, "[host-prefix] restored a prefix block from DRAM\n");
+    }
+
+    void pin(uint64_t hash) {
+        std::lock_guard<std::mutex> lock(m_budget->mutex);
+        m_pinned.insert(hash);
+    }
+
+    void unpin() {
+        std::lock_guard<std::mutex> lock(m_budget->mutex);
+        m_pinned.clear();
     }
 
 private:
@@ -156,11 +164,15 @@ private:
     };
 
     bool drop_oldest() {
-        if (m_order.empty()) {
+        auto order = m_order.begin();
+        while (order != m_order.end() && m_pinned.count(*order) > 0) {
+            ++order;
+        }
+        if (order == m_order.end()) {
             return false;
         }
-        const uint64_t hash = m_order.front();
-        m_order.pop_front();
+        const uint64_t hash = *order;
+        m_order.erase(order);
         const auto it = m_entries.find(hash);
         if (it == m_entries.end()) {
             return false;
@@ -197,6 +209,7 @@ private:
     std::function<void(uint64_t)> m_on_drop;
     std::map<uint64_t, Entry> m_entries;
     std::list<uint64_t> m_order;
+    std::unordered_set<uint64_t> m_pinned;
     size_t m_id = 0;
     std::atomic<bool> m_announced_save{false};
     std::atomic<bool> m_announced_load{false};

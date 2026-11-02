@@ -228,6 +228,9 @@ struct HostSpillHooks {
     std::function<void(uint64_t hash, int block_index)> save;
     std::function<bool(uint64_t hash)> contains;
     std::function<void(uint64_t hash, int block_index)> load;
+    // Hashes for the prefix currently being staged. A spill must not drop these to make room.
+    std::function<void(uint64_t hash)> pin;
+    std::function<void()> unpin;
 };
 
 /**
@@ -855,6 +858,18 @@ public:
     void host_load(uint64_t hash, int block_index) {
         OPENVINO_ASSERT(m_host_spill.load, "Host prefix restore requested without a spill store");
         m_host_spill.load(hash, block_index);
+    }
+
+    void host_pin(uint64_t hash) {
+        if (m_host_spill.pin) {
+            m_host_spill.pin(hash);
+        }
+    }
+
+    void host_unpin() {
+        if (m_host_spill.unpin) {
+            m_host_spill.unpin();
+        }
     }
 
     bool overwriteable_has(uint64_t hash) const {
@@ -2841,6 +2856,9 @@ private:
             BlockAllocator* allocator = nullptr;
             std::vector<BlocksPerLayer>* rows = nullptr;
             ~DetachedGuard() {
+                if (allocator != nullptr) {
+                    allocator->host_unpin();
+                }
                 if (allocator == nullptr || rows == nullptr) {
                     return;
                 }
@@ -2851,6 +2869,13 @@ private:
                 }
             }
         } guard{&m_allocator, &detached};
+        for (size_t content_length : plan.block_content_lengths) {
+            const uint64_t hash = sequence->get_hash(content_length, m_block_size);
+            if (m_allocator.host_contains(hash)) {
+                m_allocator.host_pin(hash);
+            }
+        }
+        size_t loaded = 0;
         for (size_t content_length : plan.block_content_lengths) {
             const uint64_t hash = sequence->get_hash(content_length, m_block_size);
             BlocksPerLayer rows = m_allocator.detach_overwriteable(hash);
@@ -2865,17 +2890,30 @@ private:
                 continue;
             }
             if (!m_allocator.host_contains(hash) || !m_allocator.can_allocate_blocks(1)) {
+                if (loaded > 0) {
+                    std::fprintf(stderr, "[host-prefix] staged %zu host blocks then stopped\n", loaded);
+                    std::fflush(stderr);
+                }
                 return false;
             }
             BlocksPerLayer blocks = allocate_cached_block(hash, content_length);
             if (blocks.size() != m_num_layers || !blocks.front()) {
+                if (loaded > 0) {
+                    std::fprintf(stderr, "[host-prefix] staged %zu host blocks then stopped\n", loaded);
+                    std::fflush(stderr);
+                }
                 return false;
             }
             m_allocator.host_load(hash, blocks.front()->get_index());
+            ++loaded;
             for (auto& block : blocks) {
                 block->release();
             }
             m_allocator.park_overwriteable(blocks);
+        }
+        if (loaded > 0) {
+            std::fprintf(stderr, "[host-prefix] staged %zu host blocks\n", loaded);
+            std::fflush(stderr);
         }
         return true;
     }

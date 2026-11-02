@@ -251,6 +251,12 @@ public:
             hooks.load = [store](uint64_t hash, int block_index) {
                 store->load(hash, block_index);
             };
+            hooks.pin = [store](uint64_t hash) {
+                store->pin(hash);
+            };
+            hooks.unpin = [store]() {
+                store->unpin();
+            };
             block_mgr->set_host_spill(std::move(hooks));
         }
         m_cache_managers[type] = std::move(cache_mgr);
