@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <functional>
 #include <limits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -225,12 +226,16 @@ class CacheStateDumper;
 // Copies a prefix block to host memory before its device slot is overwritten, and copies it back
 // when a later prompt needs that hash. Empty hooks leave prefix caching unchanged.
 struct HostSpillHooks {
-    std::function<void(uint64_t hash, int block_index)> save;
+    std::function<bool(uint64_t hash, int block_index)> save;
     std::function<bool(uint64_t hash)> contains;
     std::function<bool(uint64_t hash, int block_index)> load;
     // Hashes for the prefix currently being staged. A spill must not drop these to make room.
     std::function<void(uint64_t hash)> pin;
     std::function<void()> unpin;
+    // True after a finished block was copied to DRAM. GPU bytes for that hash are no longer authoritative.
+    std::function<bool(uint64_t hash)> authoritative;
+    // True when a finished block was overwritten without a usable DRAM snapshot. Never restore it.
+    std::function<bool(uint64_t hash)> untrusted;
 };
 
 /**
@@ -249,16 +254,19 @@ class BlockAllocator {
     HostSpillHooks m_host_spill;
 
     void spill_published(const BlocksPerLayer& blocks) {
-        if (!m_host_spill.save || blocks.empty() || !blocks.front()->has_published_hash()) {
+        if (!m_host_spill.save || blocks.empty() || !blocks.front() || !blocks.front()->is_free() ||
+            !blocks.front()->has_published_hash()) {
             return;
         }
         const int index = blocks.front()->get_index();
-        for (size_t layer = 1; layer < blocks.size(); ++layer) {
-            if (blocks[layer]->get_index() != index) {
+        const size_t hash = blocks.front()->get_hash();
+        for (const auto& block : blocks) {
+            if (!block || !block->is_free() || !block->has_published_hash() || block->get_hash() != hash ||
+                block->get_index() != index) {
                 return;
             }
         }
-        m_host_spill.save(static_cast<uint64_t>(blocks.front()->get_hash()), index);
+        m_host_spill.save(static_cast<uint64_t>(hash), index);
     }
 
 public:
@@ -854,10 +862,14 @@ public:
     }
 
     bool has_cached_block(size_t hash, const std::map<uint64_t, BlocksPerLayer>& cached_blocks) const {
-        if (rows_match_hash(peek_cached_block(static_cast<uint64_t>(hash), cached_blocks), static_cast<uint64_t>(hash))) {
-            return true;
+        const uint64_t key = static_cast<uint64_t>(hash);
+        if (m_host_spill.untrusted && m_host_spill.untrusted(key)) {
+            return false;
         }
-        return m_host_spill.contains && m_host_spill.contains(static_cast<uint64_t>(hash));
+        if (m_host_spill.authoritative && m_host_spill.authoritative(key)) {
+            return m_host_spill.contains && m_host_spill.contains(key);
+        }
+        return rows_match_hash(peek_cached_block(key, cached_blocks), key);
     }
 
     void set_host_spill(HostSpillHooks hooks) {
@@ -1035,6 +1047,8 @@ private:
     bool m_restore_latest_prefix_block_only = false;
     // TODO: caching time can probably be improved if we use the prefix tree
     std::map<uint64_t, BlocksPerLayer> m_prefix_hash_to_cached_blocks;
+    std::unordered_set<uint64_t> m_host_authoritative;
+    std::unordered_set<uint64_t> m_gpu_untrusted;
     std::map<size_t, size_t> m_cached_content_length_ref_counts;
     std::map<uint64_t, size_t> m_cached_hash_to_content_length;
 
@@ -1110,6 +1124,9 @@ public:
         const auto sequences = group->get_not_finished_sequences();
         OPENVINO_ASSERT(sequences.size() == 1, "Prefix restore requires one sequence");
         const auto& sequence = sequences.front();
+        if (prefix_backing_unlocked(group, plan) == PrefixBacking::Absent) {
+            return std::nullopt;
+        }
         const uint64_t seq_id = sequence->get_id();
         OPENVINO_ASSERT(m_block_table.count(seq_id) == 0 && m_linear_attention_live_states.count(seq_id) == 0 &&
                             m_temporary_block_table.count(seq_id) == 0,
@@ -1373,14 +1390,40 @@ public:
         m_allocator.set_host_spill(std::move(hooks));
     }
 
-    // Called while this manager's cache lock is already held, when a host copy is discarded.
-    // A GPU map entry counts only when the block still publishes this hash. A stale entry
-    // would make the next prompt skip prefill and read another chat's bytes.
-    void forget_host_hash_unlocked(uint64_t hash) {
-        const BlocksPerLayer rows = m_allocator.peek_cached_block(hash, m_prefix_hash_to_cached_blocks);
-        if (m_allocator.rows_match_hash(rows, hash)) {
+    // A snapshot is recorded only for a finished block. A failed copy, or a later drop of that
+    // copy, makes the hash unusable: the GPU slot is about to be or has already been reused.
+    bool host_restore_forbidden(uint64_t hash) const {
+        return m_gpu_untrusted.count(hash) > 0;
+    }
+
+    bool host_snapshot_authoritative(uint64_t hash) const {
+        return m_gpu_untrusted.count(hash) == 0 && m_host_authoritative.count(hash) > 0;
+    }
+
+    void note_host_spill_result(uint64_t hash, bool saved) {
+        if (m_gpu_untrusted.count(hash) > 0) {
             return;
         }
+        if (saved) {
+            m_host_authoritative.insert(hash);
+        } else {
+            m_gpu_untrusted.insert(hash);
+        }
+    }
+
+    enum class PrefixBacking { Absent, GpuOriginal, HostSnapshot };
+
+    // Every block in the plan must come from one place. A mix of an original GPU block and a
+    // DRAM snapshot, or a hole, is not a prefix of this prompt.
+    PrefixBacking prefix_backing_for(const SequenceGroup::Ptr& group, const PrefixRestorePlan& plan) {
+        std::lock_guard<std::mutex> lock(m_cached_blocks_map_mutex);
+        return prefix_backing_unlocked(group, plan);
+    }
+
+    // Called while this manager's cache lock is already held, when a host copy is discarded.
+    void forget_host_hash_unlocked(uint64_t hash) {
+        m_host_authoritative.erase(hash);
+        m_gpu_untrusted.insert(hash);
         unregister_cached_hash(hash);
     }
 
@@ -2819,6 +2862,37 @@ public:
     }
 
 private:
+    PrefixBacking prefix_backing_unlocked(const SequenceGroup::Ptr& group, const PrefixRestorePlan& plan) const {
+        if (plan.empty()) {
+            return PrefixBacking::Absent;
+        }
+        const auto sequences = group->get_not_finished_sequences();
+        if (sequences.size() != 1) {
+            return PrefixBacking::Absent;
+        }
+        const auto& sequence = sequences.front();
+        std::optional<PrefixBacking> kind;
+        for (size_t content_length : plan.block_content_lengths) {
+            const uint64_t hash = sequence->get_hash(content_length, m_block_size);
+            PrefixBacking block_kind = PrefixBacking::Absent;
+            if (m_host_authoritative.count(hash) > 0 && m_gpu_untrusted.count(hash) == 0 &&
+                m_allocator.host_contains(hash)) {
+                block_kind = PrefixBacking::HostSnapshot;
+            } else if (m_gpu_untrusted.count(hash) == 0 && m_host_authoritative.count(hash) == 0 &&
+                       m_allocator.rows_match_hash(
+                           m_allocator.peek_cached_block(hash, m_prefix_hash_to_cached_blocks), hash)) {
+                block_kind = PrefixBacking::GpuOriginal;
+            } else {
+                return PrefixBacking::Absent;
+            }
+            if (kind.has_value() && *kind != block_kind) {
+                return PrefixBacking::Absent;
+            }
+            kind = block_kind;
+        }
+        return kind.value_or(PrefixBacking::Absent);
+    }
+
     PrefixRestorePlan get_prefix_restore_plan_unlocked(SequenceGroup::Ptr group, size_t max_cache_token_position) const {
         PrefixRestorePlan plan;
         if (!m_enable_prefix_caching || max_cache_token_position == 0) {
@@ -2839,7 +2913,7 @@ private:
     }
 
     bool restore_cached_blocks_unlocked(SequenceGroup::Ptr group, const PrefixRestorePlan& plan) {
-        if (plan.empty()) {
+        if (plan.empty() || prefix_backing_unlocked(group, plan) == PrefixBacking::Absent) {
             return false;
         }
 

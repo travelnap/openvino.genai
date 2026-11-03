@@ -238,8 +238,19 @@ public:
             });
             m_host_stores.push_back(store);
             HostSpillHooks hooks;
-            hooks.save = [store](uint64_t hash, int block_index) {
-                store->save(hash, block_index);
+            hooks.save = [store, manager](uint64_t hash, int block_index) {
+                if (manager->host_restore_forbidden(hash)) {
+                    return false;
+                }
+                const bool saved = store->save(hash, block_index);
+                manager->note_host_spill_result(hash, saved);
+                return saved;
+            };
+            hooks.authoritative = [manager](uint64_t hash) {
+                return manager->host_snapshot_authoritative(hash);
+            };
+            hooks.untrusted = [manager](uint64_t hash) {
+                return manager->host_restore_forbidden(hash);
             };
             hooks.contains = [store](uint64_t hash) {
                 return store->contains(hash);
@@ -463,6 +474,19 @@ public:
                 if (kv_plan.empty() || la_plan.empty()) {
                     return;
                 }
+            }
+
+            const auto kv_backing = kv_block_mgr.prefix_backing_for(sequence_group, kv_plan);
+            const auto la_backing = la_block_mgr.prefix_backing_for(sequence_group, la_plan);
+            if (kv_backing == BlockManager::PrefixBacking::Absent || kv_backing != la_backing) {
+                static bool announced = false;
+                if (!announced) {
+                    announced = true;
+                    std::fprintf(stderr,
+                                 "[host-prefix] refused a restore whose KV and linear-attention snapshots disagree\n");
+                    std::fflush(stderr);
+                }
+                return;
             }
 
             auto prepared_kv = kv_block_mgr.prepare_prefix_restore(sequence_group, kv_plan);

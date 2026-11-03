@@ -189,37 +189,43 @@ public:
     HostPrefixStore(const HostPrefixStore&) = delete;
     HostPrefixStore& operator=(const HostPrefixStore&) = delete;
 
-    void save(uint64_t hash, int block_index) {
+    // True when a snapshot of this finished block is stored. False means the GPU copy is about
+    // to be overwritten and must not be reused as a prefix.
+    bool save(uint64_t hash, int block_index) {
         if (block_index < 0 || !m_budget->enabled) {
-            return;
+            return false;
         }
         std::lock_guard<std::mutex> lock(m_budget->mutex);
         trim_to_limit_unlocked();
-        if (m_budget->limit == 0 || m_entries.count(hash) > 0) {
-            return;
+        if (m_entries.count(hash) > 0) {
+            return true;
+        }
+        if (m_budget->limit == 0) {
+            return false;
         }
         std::vector<ov::Tensor> tensors;
         m_cache->export_block(static_cast<size_t>(block_index), tensors);
         if (tensors.empty()) {
-            return;
+            return false;
         }
         size_t bytes = 0;
         for (const auto& tensor : tensors) {
             bytes += tensor.get_byte_size();
         }
         if (bytes == 0 || bytes > m_budget->limit) {
-            return;
+            return false;
         }
         while (m_budget->used + bytes > m_budget->limit) {
             if (!drop_any_oldest()) {
                 note_once(m_announced_skip, "[host-prefix] a prefix block does not fit in the remaining DRAM cap\n");
-                return;
+                return false;
             }
         }
         m_budget->used += bytes;
         m_order.push_back(hash);
         m_entries.emplace(hash, Entry{std::move(tensors), bytes});
         note_once(m_announced_save, "[host-prefix] spilled a GPU prefix block to DRAM\n");
+        return true;
     }
 
     bool contains(uint64_t hash) const {
