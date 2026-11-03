@@ -227,7 +227,7 @@ class CacheStateDumper;
 struct HostSpillHooks {
     std::function<void(uint64_t hash, int block_index)> save;
     std::function<bool(uint64_t hash)> contains;
-    std::function<void(uint64_t hash, int block_index)> load;
+    std::function<bool(uint64_t hash, int block_index)> load;
     // Hashes for the prefix currently being staged. A spill must not drop these to make room.
     std::function<void(uint64_t hash)> pin;
     std::function<void()> unpin;
@@ -840,8 +840,21 @@ public:
         return {};
     }
 
+    bool rows_match_hash(const BlocksPerLayer& blocks, uint64_t hash) const {
+        if (blocks.size() != m_num_layers || blocks.empty() || !blocks.front()) {
+            return false;
+        }
+        const int index = blocks.front()->get_index();
+        for (const auto& block : blocks) {
+            if (!block || !block->has_published_hash() || block->get_hash() != hash || block->get_index() != index) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool has_cached_block(size_t hash, const std::map<uint64_t, BlocksPerLayer>& cached_blocks) const {
-        if (m_overwriteable_blocks.has_block(hash) || cached_blocks.count(hash) > 0) {
+        if (rows_match_hash(peek_cached_block(static_cast<uint64_t>(hash), cached_blocks), static_cast<uint64_t>(hash))) {
             return true;
         }
         return m_host_spill.contains && m_host_spill.contains(static_cast<uint64_t>(hash));
@@ -855,9 +868,47 @@ public:
         return m_host_spill.contains && m_host_spill.contains(hash);
     }
 
-    void host_load(uint64_t hash, int block_index) {
-        OPENVINO_ASSERT(m_host_spill.load, "Host prefix restore requested without a spill store");
-        m_host_spill.load(hash, block_index);
+    bool host_load(uint64_t hash, int block_index) {
+        return m_host_spill.load && m_host_spill.load(hash, block_index);
+    }
+
+    // A detached row is parked only when its published hash is still the lookup key.
+    // A mismatched row is returned to the free pool so a later restore cannot treat it as that prefix.
+    void reclaim_detached(const BlocksPerLayer& blocks) {
+        if (blocks.size() != m_num_layers || blocks.empty() || !blocks.front()) {
+            return;
+        }
+        const bool published = blocks.front()->has_published_hash();
+        const size_t hash = published ? blocks.front()->get_hash() : 0;
+        const bool consistent = published && rows_match_hash(blocks, hash) &&
+                                std::all_of(blocks.begin(), blocks.end(), [](const CacheBlock::Ptr& block) {
+                                    return block->is_free();
+                                });
+        if (consistent && m_overwriteable_blocks.m_blocks.count(hash) == 0) {
+            m_overwriteable_blocks.add(blocks);
+            return;
+        }
+        if (consistent && m_overwriteable_blocks.m_blocks[hash] == blocks) {
+            return;
+        }
+        for (size_t layer = 0; layer < m_num_layers; ++layer) {
+            blocks[layer]->clear_published_hash();
+            if (blocks[layer]->is_free()) {
+                m_free_blocks[layer].push_back(blocks[layer]);
+                ++m_free_blocks_num[layer];
+            }
+        }
+    }
+
+    void discard_fresh_row(const BlocksPerLayer& blocks) {
+        OPENVINO_ASSERT(blocks.size() == m_num_layers);
+        for (size_t layer = 0; layer < m_num_layers; ++layer) {
+            blocks[layer]->clear_published_hash();
+            blocks[layer]->release();
+            OPENVINO_ASSERT(blocks[layer]->is_free(), "Staged prefix row is still referenced");
+            m_free_blocks[layer].push_back(blocks[layer]);
+            ++m_free_blocks_num[layer];
+        }
     }
 
     void host_pin(uint64_t hash) {
@@ -1086,9 +1137,10 @@ public:
             if (rows.size() != m_num_layers) {
                 return std::nullopt;
             }
+            if (!m_allocator.rows_match_hash(rows, hash)) {
+                return std::nullopt;
+            }
             for (size_t layer = 0; layer < m_num_layers; ++layer) {
-                OPENVINO_ASSERT(rows[layer]->has_published_hash() && rows[layer]->get_hash() == hash,
-                                "Restored prefix row identity is inconsistent");
                 tables[layer].push_back(rows[layer]);
             }
             releases.push_back(m_allocator.prepare_block_release(rows, m_prefix_hash_to_cached_blocks));
@@ -1322,8 +1374,11 @@ public:
     }
 
     // Called while this manager's cache lock is already held, when a host copy is discarded.
+    // A GPU map entry counts only when the block still publishes this hash. A stale entry
+    // would make the next prompt skip prefill and read another chat's bytes.
     void forget_host_hash_unlocked(uint64_t hash) {
-        if (m_allocator.overwriteable_has(hash) || m_prefix_hash_to_cached_blocks.count(hash) > 0) {
+        const BlocksPerLayer rows = m_allocator.peek_cached_block(hash, m_prefix_hash_to_cached_blocks);
+        if (m_allocator.rows_match_hash(rows, hash)) {
             return;
         }
         unregister_cached_hash(hash);
@@ -2836,9 +2891,11 @@ private:
     }
 
     bool reserve_prefix_slot(uint64_t hash, size_t& reserved_slots) const {
-        const bool in_overwriteable = m_allocator.overwriteable_has(hash);
-        const bool on_device = in_overwriteable || m_prefix_hash_to_cached_blocks.count(hash) > 0;
-        const size_t next = reserved_slots + ((in_overwriteable || !on_device) ? 1 : 0);
+        const BlocksPerLayer rows = m_allocator.peek_cached_block(hash, m_prefix_hash_to_cached_blocks);
+        const bool valid_on_device = m_allocator.rows_match_hash(rows, hash);
+        const bool in_overwriteable = valid_on_device && m_allocator.overwriteable_has(hash);
+        // A live matching row is already resident. Anything else needs a device slot for the snapshot.
+        const size_t next = reserved_slots + ((in_overwriteable || !valid_on_device) ? 1 : 0);
         if (next > m_allocator.num_free_blocks(0)) {
             return false;
         }
@@ -2846,70 +2903,146 @@ private:
         return true;
     }
 
-    // Pulls prefix blocks that only exist in host memory back into device slots before the
-    // ordinary restore path peeks them. Device blocks that belong to this plan are held out of
-    // the LRU list so bringing one block back cannot overwrite another block of the same prefix.
-    bool stage_host_prefix_blocks(const Sequence::Ptr& sequence, const PrefixRestorePlan& plan) {
-        std::vector<BlocksPerLayer> detached;
-        detached.reserve(plan.block_content_lengths.size());
-        struct DetachedGuard {
-            BlockAllocator* allocator = nullptr;
-            std::vector<BlocksPerLayer>* rows = nullptr;
-            ~DetachedGuard() {
-                if (allocator != nullptr) {
-                    allocator->host_unpin();
-                }
-                if (allocator == nullptr || rows == nullptr) {
-                    return;
-                }
-                for (auto& row : *rows) {
-                    if (!row.empty()) {
-                        allocator->park_overwriteable(row);
-                    }
+    void abandon_staged_row(uint64_t hash, const BlocksPerLayer& blocks) {
+        const auto registered = m_prefix_hash_to_cached_blocks.find(hash);
+        if (registered != m_prefix_hash_to_cached_blocks.end() && registered->second == blocks) {
+            m_prefix_hash_to_cached_blocks.erase(registered);
+        }
+        unregister_cached_hash(hash);
+        m_allocator.discard_fresh_row(blocks);
+    }
+
+    // Puts a detached row back. A row whose published hash still matches stays a prefix.
+    // A row that was reused under a different hash goes back to the free pool.
+    void reclaim_held(uint64_t detached_key, const BlocksPerLayer& rows) {
+        if (rows.empty() || !rows.front()) {
+            return;
+        }
+        if (rows.front()->has_published_hash() && m_allocator.rows_match_hash(rows, rows.front()->get_hash())) {
+            const uint64_t published = rows.front()->get_hash();
+            const auto registered = m_prefix_hash_to_cached_blocks.find(published);
+            const bool registered_here = registered != m_prefix_hash_to_cached_blocks.end() && registered->second == rows;
+            if (registered_here && !m_allocator.overwriteable_has(published)) {
+                m_allocator.park_overwriteable(rows);
+            }
+            if (detached_key != published) {
+                const auto stale = m_prefix_hash_to_cached_blocks.find(detached_key);
+                if (stale != m_prefix_hash_to_cached_blocks.end() && stale->second == rows) {
+                    m_prefix_hash_to_cached_blocks.erase(stale);
                 }
             }
-        } guard{&m_allocator, &detached};
+            if (registered_here || m_allocator.overwriteable_has(published)) {
+                return;
+            }
+        }
+        const auto stale = m_prefix_hash_to_cached_blocks.find(detached_key);
+        if (stale != m_prefix_hash_to_cached_blocks.end() && stale->second == rows) {
+            m_prefix_hash_to_cached_blocks.erase(stale);
+        }
+        m_allocator.reclaim_detached(rows);
+    }
+
+    // Copies host snapshots back onto the device rows for this prefix. A GPU row is reused
+    // only when every layer still publishes the looked-up hash. A live row (refcount > 0)
+    // is left in place so a running sequence is not overwritten.
+    bool stage_host_prefix_blocks(const Sequence::Ptr& sequence, const PrefixRestorePlan& plan) {
+        struct Held {
+            uint64_t key = 0;
+            BlocksPerLayer rows;
+        };
+        std::vector<Held> detached;
+        detached.reserve(plan.block_content_lengths.size());
+        struct DetachedGuard {
+            BlockManager* manager = nullptr;
+            std::vector<Held>* rows = nullptr;
+            ~DetachedGuard() {
+                if (manager != nullptr) {
+                    manager->m_allocator.host_unpin();
+                }
+                if (manager == nullptr || rows == nullptr) {
+                    return;
+                }
+                for (auto& held : *rows) {
+                    manager->reclaim_held(held.key, held.rows);
+                }
+            }
+        } guard{this, &detached};
         for (size_t content_length : plan.block_content_lengths) {
             const uint64_t hash = sequence->get_hash(content_length, m_block_size);
             if (m_allocator.host_contains(hash)) {
                 m_allocator.host_pin(hash);
             }
         }
-        size_t loaded = 0;
         for (size_t content_length : plan.block_content_lengths) {
             const uint64_t hash = sequence->get_hash(content_length, m_block_size);
             BlocksPerLayer rows = m_allocator.detach_overwriteable(hash);
             if (!rows.empty()) {
-                detached.push_back(std::move(rows));
+                detached.push_back(Held{hash, std::move(rows)});
             }
         }
+        size_t loaded = 0;
+        auto stop = [&]() {
+            if (loaded > 0) {
+                std::fprintf(stderr, "[host-prefix] staged %zu host blocks then stopped\n", loaded);
+                std::fflush(stderr);
+            }
+            return false;
+        };
         for (size_t content_length : plan.block_content_lengths) {
             const uint64_t hash = sequence->get_hash(content_length, m_block_size);
-            const BlocksPerLayer existing = m_allocator.peek_cached_block(hash, m_prefix_hash_to_cached_blocks);
-            if (existing.size() == m_num_layers) {
+            Held* held = nullptr;
+            for (auto& candidate : detached) {
+                if (candidate.key == hash) {
+                    held = &candidate;
+                    break;
+                }
+            }
+            const bool held_ok = held != nullptr && m_allocator.rows_match_hash(held->rows, hash);
+            const BlocksPerLayer peeked = m_allocator.peek_cached_block(hash, m_prefix_hash_to_cached_blocks);
+            const bool peeked_ok = m_allocator.rows_match_hash(peeked, hash);
+            const bool in_host = m_allocator.host_contains(hash);
+            if (in_host) {
+                BlocksPerLayer dest;
+                bool fresh = false;
+                if (held_ok) {
+                    dest = held->rows;
+                } else if (peeked_ok && peeked.front()->get_references_count() > 0) {
+                    continue;
+                } else if (peeked_ok) {
+                    dest = peeked;
+                } else if (!m_allocator.can_allocate_blocks(1)) {
+                    return stop();
+                } else {
+                    dest = allocate_cached_block(hash, content_length);
+                    if (!m_allocator.rows_match_hash(dest, hash)) {
+                        if (!dest.empty()) {
+                            abandon_staged_row(hash, dest);
+                        }
+                        return stop();
+                    }
+                    fresh = true;
+                }
+                if (!m_allocator.host_load(hash, dest.front()->get_index())) {
+                    if (fresh) {
+                        abandon_staged_row(hash, dest);
+                    }
+                    return stop();
+                }
+                ++loaded;
+                if (fresh) {
+                    for (auto& block : dest) {
+                        block->release();
+                    }
+                    m_allocator.park_overwriteable(dest);
+                }
                 continue;
             }
-            if (!m_allocator.host_contains(hash) || !m_allocator.can_allocate_blocks(1)) {
-                if (loaded > 0) {
-                    std::fprintf(stderr, "[host-prefix] staged %zu host blocks then stopped\n", loaded);
-                    std::fflush(stderr);
-                }
-                return false;
+            if (held_ok || peeked_ok) {
+                continue;
             }
-            BlocksPerLayer blocks = allocate_cached_block(hash, content_length);
-            if (blocks.size() != m_num_layers || !blocks.front()) {
-                if (loaded > 0) {
-                    std::fprintf(stderr, "[host-prefix] staged %zu host blocks then stopped\n", loaded);
-                    std::fflush(stderr);
-                }
-                return false;
-            }
-            m_allocator.host_load(hash, blocks.front()->get_index());
-            ++loaded;
-            for (auto& block : blocks) {
-                block->release();
-            }
-            m_allocator.park_overwriteable(blocks);
+            std::fprintf(stderr, "[host-prefix] skipped a GPU block whose hash does not match\n");
+            std::fflush(stderr);
+            return stop();
         }
         if (loaded > 0) {
             std::fprintf(stderr, "[host-prefix] staged %zu host blocks\n", loaded);

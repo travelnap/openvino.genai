@@ -134,17 +134,19 @@ public:
         return m_entries.count(hash) > 0;
     }
 
-    void load(uint64_t hash, int block_index) {
+    // False means the snapshot is gone. The caller must not keep the device block under this hash.
+    bool load(uint64_t hash, int block_index) {
         if (block_index < 0) {
-            return;
+            return false;
         }
         std::lock_guard<std::mutex> lock(m_budget->mutex);
         const auto it = m_entries.find(hash);
         if (it == m_entries.end()) {
-            return;
+            return false;
         }
         m_cache->import_block(static_cast<size_t>(block_index), it->second.tensors);
         note_once(m_announced_load, "[host-prefix] restored a prefix block from DRAM\n");
+        return true;
     }
 
     void pin(uint64_t hash) {

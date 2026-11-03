@@ -249,7 +249,7 @@ public:
                 return store->contains(hash);
             };
             hooks.load = [store](uint64_t hash, int block_index) {
-                store->load(hash, block_index);
+                return store->load(hash, block_index);
             };
             hooks.pin = [store](uint64_t hash) {
                 store->pin(hash);
