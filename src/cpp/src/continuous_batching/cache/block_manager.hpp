@@ -253,16 +253,19 @@ class BlockAllocator {
     ov::genai::OverwritableBlocksHashStore m_overwriteable_blocks;
     HostSpillHooks m_host_spill;
 
+    // A finished block has no running sequence attached. The overwrite path takes one reference
+    // before this copy, so refcount 0 or 1 is still the previous snapshot. A higher count means
+    // a sequence is still using the block and its bytes are not ready to keep.
     void spill_published(const BlocksPerLayer& blocks) {
-        if (!m_host_spill.save || blocks.empty() || !blocks.front() || !blocks.front()->is_free() ||
-            !blocks.front()->has_published_hash()) {
+        if (!m_host_spill.save || blocks.empty() || !blocks.front() ||
+            !blocks.front()->has_published_hash() || blocks.front()->get_references_count() > 1) {
             return;
         }
         const int index = blocks.front()->get_index();
         const size_t hash = blocks.front()->get_hash();
         for (const auto& block : blocks) {
-            if (!block || !block->is_free() || !block->has_published_hash() || block->get_hash() != hash ||
-                block->get_index() != index) {
+            if (!block || !block->has_published_hash() || block->get_references_count() > 1 ||
+                block->get_hash() != hash || block->get_index() != index) {
                 return;
             }
         }
