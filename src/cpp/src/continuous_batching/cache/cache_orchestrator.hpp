@@ -229,13 +229,9 @@ public:
             "Cache types without per-layer block-table control must register exactly one shared block-table layer");
         if (m_host_budget == nullptr) {
             m_host_budget = std::make_shared<HostPrefixBudget>();
-            m_host_budget->limit = host_prefix_budget_bytes();
-            if (m_host_budget->limit > 0) {
-                std::fprintf(stderr, "[host-prefix] DRAM prefix store cap %zu bytes\n", m_host_budget->limit);
-                std::fflush(stderr);
-            }
+            configure_host_prefix_budget(m_host_budget);
         }
-        if (m_host_budget->limit > 0) {
+        if (m_host_budget->enabled) {
             BlockManager* manager = block_mgr.get();
             auto store = std::make_shared<HostPrefixStore>(cache_mgr.get(), m_host_budget, [manager](uint64_t hash) {
                 manager->forget_host_hash_unlocked(hash);

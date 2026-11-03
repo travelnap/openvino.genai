@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -59,11 +60,102 @@ inline bool cache_block_can_spill(const ov::Tensor& cache) {
 
 // Bytes of prefix blocks that no longer fit in the device pool. One budget is shared by every
 // cache type so a hybrid model cannot keep KV blocks for a chat whose linear-attention state was dropped.
+//
+// The cap is one of three modes, chosen by environment variables at startup:
+//   OV_GENAI_HOST_PREFIX_BYTES          exact cap; 0 turns the store off
+//   OV_GENAI_HOST_PREFIX_PERCENT        percent of total physical RAM (1-100)
+//   OV_GENAI_HOST_PREFIX_RESERVE_BYTES  leave this much physical RAM free
+// Bytes wins over percent, and percent wins over reserve. With none set, the store
+// uses idle RAM and leaves 5 GiB free. The reserve cap is recomputed on each spill
+// from memory still available plus the bytes this store already holds.
+enum class HostPrefixLimitKind { Fixed, Percent, Reserve };
+
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) int __stdcall GlobalMemoryStatusEx(void*);
+#endif
+
 struct HostPrefixBudget {
     std::mutex mutex;
+    HostPrefixLimitKind kind = HostPrefixLimitKind::Reserve;
+    bool enabled = true;
     size_t limit = 0;
     size_t used = 0;
+    size_t fixed_bytes = 0;
+    size_t percent = 0;
+    size_t reserve_bytes = 5ULL << 30;
+    size_t logged_limit = static_cast<size_t>(-1);
     std::vector<std::pair<size_t, std::function<bool()>>> droppers;
+
+    void refresh_unlocked() {
+        if (!enabled) {
+            limit = 0;
+            note_limit_unlocked();
+            return;
+        }
+        if (kind == HostPrefixLimitKind::Fixed) {
+            limit = fixed_bytes;
+            note_limit_unlocked();
+            return;
+        }
+        size_t avail = 0;
+        size_t total = 0;
+        if (!query_physical_memory(avail, total)) {
+            if (limit == 0) {
+                limit = 16ULL << 30;
+            }
+            note_limit_unlocked();
+            return;
+        }
+        if (kind == HostPrefixLimitKind::Percent) {
+            limit = (total / 100) * percent;
+        } else if (avail + used > reserve_bytes) {
+            limit = avail + used - reserve_bytes;
+        } else {
+            limit = 0;
+        }
+        note_limit_unlocked();
+    }
+
+private:
+    void note_limit_unlocked() {
+        const size_t previous = logged_limit;
+        if (previous != static_cast<size_t>(-1)) {
+            const size_t delta = limit > previous ? limit - previous : previous - limit;
+            if (delta < (512ULL << 20)) {
+                return;
+            }
+        }
+        std::fprintf(stderr, "[host-prefix] DRAM prefix cap is now %zu bytes\n", limit);
+        std::fflush(stderr);
+        logged_limit = limit;
+    }
+
+    static bool query_physical_memory(size_t& avail, size_t& total) {
+#if defined(_WIN32)
+        struct Status {
+            uint32_t length;
+            uint32_t load;
+            uint64_t total_phys;
+            uint64_t avail_phys;
+            uint64_t total_page;
+            uint64_t avail_page;
+            uint64_t total_virtual;
+            uint64_t avail_virtual;
+            uint64_t avail_extended;
+        } status{};
+        status.length = sizeof(status);
+        if (GlobalMemoryStatusEx(&status) == 0 || status.total_phys == 0) {
+            return false;
+        }
+        avail = static_cast<size_t>(status.avail_phys);
+        total = static_cast<size_t>(status.total_phys);
+        return true;
+#else
+        (void)avail;
+        (void)total;
+        return false;
+#endif
+    }
 };
 
 class HostPrefixStore {
@@ -98,11 +190,12 @@ public:
     HostPrefixStore& operator=(const HostPrefixStore&) = delete;
 
     void save(uint64_t hash, int block_index) {
-        if (block_index < 0 || m_budget->limit == 0) {
+        if (block_index < 0 || !m_budget->enabled) {
             return;
         }
         std::lock_guard<std::mutex> lock(m_budget->mutex);
-        if (m_entries.count(hash) > 0) {
+        trim_to_limit_unlocked();
+        if (m_budget->limit == 0 || m_entries.count(hash) > 0) {
             return;
         }
         std::vector<ov::Tensor> tensors;
@@ -140,6 +233,7 @@ public:
             return false;
         }
         std::lock_guard<std::mutex> lock(m_budget->mutex);
+        trim_to_limit_unlocked();
         const auto it = m_entries.find(hash);
         if (it == m_entries.end()) {
             return false;
@@ -185,8 +279,17 @@ private:
         if (m_on_drop) {
             m_on_drop(hash);
         }
-        note_once(m_announced_drop, "[host-prefix] DRAM prefix cap is full; dropping the oldest spilled block\n");
+        note_once(m_announced_drop, "[host-prefix] DRAM prefix store is above its cap; dropping the oldest spilled block\n");
         return true;
+    }
+
+    void trim_to_limit_unlocked() {
+        m_budget->refresh_unlocked();
+        while (m_budget->used > m_budget->limit) {
+            if (!drop_any_oldest()) {
+                break;
+            }
+        }
     }
 
     bool drop_any_oldest() {
@@ -219,16 +322,51 @@ private:
     std::atomic<bool> m_announced_skip{false};
 };
 
-inline size_t host_prefix_budget_bytes() {
-    const char* env = std::getenv("OV_GENAI_HOST_PREFIX_BYTES");
-    if (env != nullptr && env[0] != '\0') {
-        char* end = nullptr;
-        const unsigned long long parsed = std::strtoull(env, &end, 10);
-        if (end != env) {
-            return static_cast<size_t>(parsed);
-        }
+inline unsigned long long parse_host_prefix_number(const char* text) {
+    if (text == nullptr || text[0] == '\0') {
+        return 0;
     }
-    return 16ULL << 30;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(text, &end, 10);
+    return end == text ? 0 : parsed;
+}
+
+inline void configure_host_prefix_budget(const std::shared_ptr<HostPrefixBudget>& budget) {
+    const char* bytes_env = std::getenv("OV_GENAI_HOST_PREFIX_BYTES");
+    const char* percent_env = std::getenv("OV_GENAI_HOST_PREFIX_PERCENT");
+    const char* reserve_env = std::getenv("OV_GENAI_HOST_PREFIX_RESERVE_BYTES");
+    if (bytes_env != nullptr && bytes_env[0] != '\0') {
+        budget->kind = HostPrefixLimitKind::Fixed;
+        budget->fixed_bytes = static_cast<size_t>(parse_host_prefix_number(bytes_env));
+        budget->enabled = budget->fixed_bytes > 0;
+        budget->refresh_unlocked();
+        std::fprintf(stderr, "[host-prefix] DRAM prefix store fixed cap %zu bytes\n", budget->limit);
+        std::fflush(stderr);
+        return;
+    }
+    if (percent_env != nullptr && percent_env[0] != '\0') {
+        unsigned long long percent = parse_host_prefix_number(percent_env);
+        if (percent > 100) {
+            percent = 100;
+        }
+        budget->kind = HostPrefixLimitKind::Percent;
+        budget->percent = static_cast<size_t>(percent);
+        budget->enabled = percent > 0;
+        budget->refresh_unlocked();
+        std::fprintf(stderr, "[host-prefix] DRAM prefix store %zu%% of physical RAM, cap %zu bytes\n",
+                     budget->percent, budget->limit);
+        std::fflush(stderr);
+        return;
+    }
+    budget->kind = HostPrefixLimitKind::Reserve;
+    budget->reserve_bytes = (reserve_env != nullptr && reserve_env[0] != '\0')
+        ? static_cast<size_t>(parse_host_prefix_number(reserve_env))
+        : (5ULL << 30);
+    budget->enabled = true;
+    budget->refresh_unlocked();
+    std::fprintf(stderr, "[host-prefix] DRAM prefix store leaves %zu bytes of RAM free, cap %zu bytes now\n",
+                 budget->reserve_bytes, budget->limit);
+    std::fflush(stderr);
 }
 
 }  // namespace ov::genai
